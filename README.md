@@ -102,7 +102,7 @@ AGENT_CONFIG = [
 
 #### 1. 克隆项目
 ```bash
-git clone https://github.com/你的用户名/werewolf-multiagent-game.git
+git clone https://github.com/Samuel-Pan/Werewolf-AI-Arena.git
 cd werewolf-multiagent-game
 ```
 
