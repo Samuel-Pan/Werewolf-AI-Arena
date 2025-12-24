@@ -1,0 +1,24 @@
+
+--- 第 1 天 - 夜晚 ---
+[Player_4 回复]: 我们决定淘汰: Player_3
+狼人团队决定淘汰: Player_3
+[Player_2 answer error (尝试 1/3)]:
+  - Error: Error code: 429 - {'errors': {'message': "You have exceeded today's quota for model deepseek-ai/DeepSeek-V3.2,  please try again tomorrow, or consider using other models", 'request_id': '51acbf97-d6bc-4348-bae2-db26459a1a73'}}
+  - Raw Exception Details: ('Error code: 429 - {\'errors\': {\'message\': "You have exceeded today\'s quota for model deepseek-ai/DeepSeek-V3.2,  please try again tomorrow, or consider using other models", \'request_id\': \'51acbf97-d6bc-4348-bae2-db26459a1a73\'}}',)
+[检测到429限流，尝试为 Player_2 切换模型]
+[Player_2] 成功切换模型: deepseek(deepseek-ai/DeepSeek-V3.2) -> qwen_vl(Qwen/Qwen3-VL-235B-A22B-Instruct)
+[Player_2 模型切换成功，准备重试]
+[Player_2 回复]: 我查验: Player_5
+预言家查验了 Player_5，结果是【狼人】。
+[Player_7 thinking process]: Player_7(thinking): （现在我是女巫Player_7，第一晚就遇到Player_3被狼人刀了。根据女巫的常规玩法，首夜救人是最稳妥的选择，因为第一晚被刀的很可能是平民或神职，而且解药不用就浪费了。虽然不知道Player_3的具体身份，但万一是预言家或者猎人这种重要角色就更不能冒险了。）
+（不过我得留个心眼，毕竟这是5人局里的小狼人杀，狼人可能会玩些花板子。但首夜不救的风险太大，还是按标准流程走比较保险。至于毒药...现在信息太少绝对不能乱用，得等白天听发言再判断。好，那就先救下Player_3看看明天的情况吧。）
+Player_7: 使用解药
+[Player_7 回复-解药]: 使用解药
+女巫使用了【解药】救了 Player_3。
+[Summary_Generator answer error (尝试 1/3)]:
+  - Error: Error code: 429 - {'errors': {'message': 'We have to rate limit you for model deepseek-ai/DeepSeek-V3.2. If you need higher limits, please consider other (commercial) API providers.', 'request_id': 'e3724078-b53c-406f-9020-eb9a21791310'}}
+  - Raw Exception Details: ("Error code: 429 - {'errors': {'message': 'We have to rate limit you for model deepseek-ai/DeepSeek-V3.2. If you need higher limits, please consider other (commercial) API providers.', 'request_id': 'e3724078-b53c-406f-9020-eb9a21791310'}}",)
+[检测到429限流，尝试为 Summary_Generator 切换模型]
+[Summary_Generator] 成功切换模型: deepseek(deepseek-ai/DeepSeek-V3.2) -> qwen_vl(Qwen/Qwen3-VL-235B-A22B-Instruct)
+[Summary_Generator 模型切换成功，准备重试]
+[为 Player_0 生成的记忆摘要]: 游戏进入第1天白天，昨晚为平安夜，无玩家被淘汰。当前阶段为自由发言环节，所有玩家均存活，尚未进行任何投票或淘汰行动。游戏进程按标准流程推进，暂无额外事件发生。记录员将持续客观记录后续发言、投票及夜间结果，确保信息准确完整。

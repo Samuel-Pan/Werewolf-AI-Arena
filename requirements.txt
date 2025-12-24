@@ -1,0 +1,18 @@
+# Python Dependencies for Werewolf Game
+
+# Core Framework
+agentscope>=0.1.0
+
+# Optional: If you need specific versions
+# agentscope==0.1.0
+
+# Note: AgentScope will automatically install its dependencies including:
+# - openai (for OpenAI-compatible API)
+# - requests
+# - pydantic
+# - etc.
+
+# Development Dependencies (Optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
