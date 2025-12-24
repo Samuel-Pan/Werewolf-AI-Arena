@@ -11,6 +11,10 @@
 </div>
 
 ---
+## 🎮 游戏截图
+在cmd命令中运行：
+<img width="1920" height="1020" alt="94669b218269d4eecff7b302db6ede86" src="https://github.com/user-attachments/assets/981668f7-3288-48ae-921b-1e037d9dee92" />
+<img width="1920" height="1020" alt="86ab4bbddebbc07cbe6f36fb2f79022b" src="https://github.com/user-attachments/assets/b7b12c46-6873-4da5-9f3a-e57ea8caef9a" />
 
 ## 🎮 游戏配置
 
@@ -138,7 +142,7 @@ python main.py
 
 ### 当前使用的 API 和模型
 
-本项目使用 **ModelScope API**，支持以下模型：
+本项目使用 **ModelScope API**，使用了以下模型：
 
 | 模型标识 | 实际模型 | 特点 |
 |---------|---------|------|
