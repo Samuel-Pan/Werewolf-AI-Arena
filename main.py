@@ -84,7 +84,8 @@ async def setup_and_run_game():
     # 创建专门用于生成记忆摘要的轻量级模型（deepseek）
     summary_provider_config = API_PROVIDERS["modelscope"]
     summary_config = {
-        "model_name": MODEL_LIST["deepseek"],
+        # "model_name": MODEL_LIST["deepseek"],
+        "model_name": MODEL_LIST["qwen_vl"],
         "api_key": summary_provider_config["api_key"],
         "base_url": summary_provider_config["base_url"],
     }

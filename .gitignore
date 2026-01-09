@@ -39,8 +39,10 @@ env/
 .DS_Store
 
 # Logs
-logs/*.log
-*.log
+logs/*.txt
+*.txt
+
+docs/
 
 # Testing
 .pytest_cache/

@@ -37,7 +37,7 @@ class GameMasterAgent(ReActAgent):
         players: List[ReActAgent],
         player_identities: Dict[str, str],
         model: None,
-        summary_model: None = None,  # 新增：专门用于生成摘要的模型
+        summary_model: None,  # 新增：专门用于生成摘要的模型
     ) -> None:
         """
         初始化裁判Agent。
@@ -208,6 +208,11 @@ class GameMasterAgent(ReActAgent):
         game_logger.add_entry(log_entry)
         await self._announce_to_public("天黑请闭眼...", role="system", to_print=True)
         
+        # 【新增】在夜晚行动前，为所有存活玩家更新记忆摘要
+        # 确保他们能获取到完整的上一天信息（发言、投票、遗言、猎人开枪等）
+        if self.game_state['day'] > 1:  # 第一天晚上不需要更新，因为还没有白天发言
+            await self._update_all_players_memory_for_night()
+        
         # 1. 狼人行动
         await self._werewolf_action()
         
@@ -369,6 +374,35 @@ class GameMasterAgent(ReActAgent):
         except Exception as e:
             game_logger.add_entry(f"[{agent.name}] 切换模型时发生错误: {e}")
             return False
+    
+    def _get_agent_model_info(self, agent) -> str:
+        """
+        获取Agent当前使用的模型信息
+        返回格式: "model_key(model_id)" 或 "Unknown"
+        """
+        try:
+            # 对于人类用户，返回特殊标记
+            if getattr(agent, 'is_user', False):
+                return "Human"
+            
+            # 获取模型名称
+            current_model_name = getattr(agent.model, 'model_name', None)
+            if not current_model_name:
+                return "Unknown"
+            
+            # 导入配置（避免循环导入）
+            from configs import MODEL_LIST
+            
+            # 查找对应的模型key
+            for key, model_id in MODEL_LIST.items():
+                if model_id == current_model_name:
+                    return f"{key}({model_id})"
+            
+            # 如果没找到对应的key，直接返回model_name
+            return f"Unknown({current_model_name})"
+            
+        except Exception:
+            return "Unknown"
 
     def _parse_ai_response(self, content: any) -> str:
         """
@@ -428,7 +462,7 @@ class GameMasterAgent(ReActAgent):
             return
 
         alive_werewolves_agents = [data["agent"] for data in alive_werewolves_data]
-        coordinator_wolf = alive_werewolves_agents[0] # 指定第一个狼人为协调者
+        coordinator_wolf = alive_werewolves_agents[0] # 指定第一个狼人作为协调者
 
         potential_targets = [
             p_name for p_name, p_info in self.game_state["players"].items()
@@ -477,7 +511,7 @@ class GameMasterAgent(ReActAgent):
         for _ in range(3): # 最多尝试3次
             # 【新功能】记录Prompt
             prompt_logger.add_prompt(
-                title=f"向 {coordinator_wolf.name} (狼人代表) 提问淘汰目标",
+                title=f"向 {coordinator_wolf} (狼人代表) 提问淘汰目标",
                 prompt=prompt_to_coordinator
             )
             # 使用静默回复来避免泄露信息
@@ -485,7 +519,9 @@ class GameMasterAgent(ReActAgent):
             # 【修复】使用新的健壮解析函数
             raw_response = self._parse_ai_response(response_msg.content)
             
-            game_logger.add_entry(f"[{coordinator_wolf.name} 回复]: {raw_response}")
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(coordinator_wolf)
+            game_logger.add_entry(f"[{coordinator_wolf.name} 狼人击杀回复 - {model_info}]: {raw_response}")
 
             # 统一处理来自用户和AI的输入
             parsed_name = raw_response
@@ -516,7 +552,11 @@ class GameMasterAgent(ReActAgent):
         if target_name:
             self.game_state["night_info"]["killed_by_werewolf"] = target_name
             log_entry = f"狼人团队决定淘汰: {target_name}"
+            
+            # 【修复】将狼人击杀记录添加到 full_history
+            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
             game_logger.add_entry(log_entry)
+            
             await self._announce_to_public("狼人已完成击杀。", role="system", to_print=False)
             # 将最终决定广播回狼人频道，让队友知晓
             await self.werewolf_channel.broadcast(Msg(self.name, f"已确认，本次淘汰目标: {target_name}", role="system"))
@@ -525,7 +565,11 @@ class GameMasterAgent(ReActAgent):
             fallback_target = random.choice(potential_targets)
             self.game_state["night_info"]["killed_by_werewolf"] = fallback_target
             log_entry = f"狼人代表未能提供有效目标，裁判随机选择淘汰: {fallback_target}"
+            
+            # 【修复】将随机击杀记录也添加到 full_history
+            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
             game_logger.add_entry(log_entry)
+            
             await self._announce_to_public("狼人已完成击杀。", role="system", to_print=False)
 
     async def _seer_action(self) -> None:
@@ -542,7 +586,7 @@ class GameMasterAgent(ReActAgent):
         memory_summary = self._get_player_memory(seer_agent.name)
         
         # 2. 获取预言家的查验历史
-        seer_history = [log for log in self.game_state["full_history"] if "预言家查验了" in log and seer_agent.name in log]
+        seer_history = [log for log in self.game_state["full_history"] if "查验了" in log and seer_agent.name in log]
         if seer_history:
             private_info = "你的查验历史如下：\n" + "\n".join(seer_history)
         else:
@@ -571,7 +615,9 @@ class GameMasterAgent(ReActAgent):
         # 【修复】使用新的健壮解析函数
         raw_response = self._parse_ai_response(response_msg.content)
 
-        game_logger.add_entry(f"[{seer_agent.name} 回复]: {raw_response}")
+        # 【新增】获取模型信息并记录到日志
+        model_info = self._get_agent_model_info(seer_agent)
+        game_logger.add_entry(f"[{seer_agent.name} 预言家查验回复 - {model_info}]: {raw_response}")
 
         parsed_name = raw_response
         if "我查验:" in raw_response:
@@ -590,15 +636,23 @@ class GameMasterAgent(ReActAgent):
         if target_name:
             target_identity = self.game_state["identities"][target_name]
             result = "好人" if target_identity != "werewolf" else "狼人"
-            log_entry = f"预言家查验了 {target_name}，结果是【{result}】。"
+            log_entry = f"预言家 {seer_agent.name} 查验了 {target_name}，结果是【{result}】。"
+            
+            # 【修复】将查验记录同时添加到 full_history 和 game_logger
+            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
             game_logger.add_entry(log_entry)
+            
             # 将查验结果私密地告诉预言家，使用特殊前缀标记
             await seer_agent.observe(Msg(self.name, f"__PRIVATE__查验结果：玩家 {target_name} 的身份是【{result}】。", role="system"))
             # 增加一个对外的模糊播报
             await self._announce_to_public("预言家已完成查验。", role="system", to_print=False)
         else:
-            log_entry = "预言家未能提供有效查验目标。"
+            log_entry = f"预言家 {seer_agent.name} 未能提供有效查验目标。"
+            
+            # 【修复】将失败记录也添加到 full_history
+            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
             game_logger.add_entry(log_entry)
+            
             # 使用特殊前缀标记私密消息
             await seer_agent.observe(Msg(self.name, "__PRIVATE__无效的查验目标。", role="system"))
             # 即使没有有效目标，也要有模糊播报以防暴露信息
@@ -627,13 +681,16 @@ class GameMasterAgent(ReActAgent):
             # 【回调】恢复告知女巫被淘汰的玩家，并通过prompt引导其行为
             # 区分User和AI的提示
             if getattr(witch_agent, 'is_user', False):
+                # 为人类用户提供明确的可接受输入集合和超时/默认行为说明
                 prompt_save = (
                     f"今晚玩家 {killed_player} 被淘汰了。\n"
                     f"你是否要使用【解药】救他？\n"
-                    f"请输入 'y' 或 'yes' 来使用解药，输入其他任何内容则视为跳过。"
+                    f"请输入 'y' / 'yes' / '使用' / '是' 来使用解药；\n"
+                    f"输入 'n' / 'no' / '不使用' / '跳过' 则不使用解药。\n"
+                    f"（超过 30s 或输入其他内容将视为不使用解药）"
                 )
             else:
-                # AI Agent的提示
+                # AI Agent的提示，要求仅回复固定短语，便于解析
                 await witch_agent.observe(Msg(self.name, f"__PRIVATE__今晚玩家 {killed_player} 被淘汰了。", role="system"))
                 prompt_save = (
                     f"你是 {witch_agent.name}，你的身份是【{ROLE_CN_MAP['witch']}】。现在是第 {self.game_state['day']} 天的夜晚。\n\n"
@@ -642,8 +699,8 @@ class GameMasterAgent(ReActAgent):
                     f"=== 当前情况 ===\n"
                     f"今晚玩家 {killed_player} 被淘汰了。你有一瓶解药可以救他。\n"
                     f"综合考虑之前的游戏进程和当前局势，决定是否使用解药。\n\n"
-                    f"如果你想使用解药，请回复 '使用解药'。\n"
-                    f"如果你想跳过，请回复 '跳过'。"
+                    f"如果你决定使用解药，请仅回复：使用解药\n"
+                    f"如果你决定不使用解药，请仅回复：不使用解药"
                 )
             
             # 【新功能】记录Prompt
@@ -656,10 +713,26 @@ class GameMasterAgent(ReActAgent):
             # 【修复】使用新的健壮解析函数
             raw_response = self._parse_ai_response(response_msg.content)
 
-            game_logger.add_entry(f"[{witch_agent.name} 回复-解药]: {raw_response}")
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(witch_agent)
+            game_logger.add_entry(f"[{witch_agent.name} 女巫解药回复 - {model_info}]: {raw_response}")
             
-            user_wants_to_save = "使用解药" in raw_response or \
-                                 (getattr(witch_agent, 'is_user', False) and raw_response.lower() in ['y', 'yes'])
+            # 标准化并解析多种同义输入，默认兜底为不使用
+            normalized = raw_response.strip().lower() if raw_response else ""
+            affirmatives = ['y', 'yes', '使用', '是', '使用解药']
+            negatives = ['n', 'no', '不使用', '跳过', '不使用解药']
+            user_wants_to_save = False
+            if getattr(witch_agent, 'is_user', False):
+                if normalized in affirmatives:
+                    user_wants_to_save = True
+                else:
+                    user_wants_to_save = False
+            else:
+                # 对于AI，优先检测明确短语 '使用解药'
+                if '使用解药' in raw_response:
+                    user_wants_to_save = True
+                else:
+                    user_wants_to_save = False
 
             if user_wants_to_save:
                 self.game_state["night_info"]["saved"] = True
@@ -707,7 +780,9 @@ class GameMasterAgent(ReActAgent):
             # 【修复】使用新的健壮解析函数
             raw_response = self._parse_ai_response(response_msg.content)
 
-            game_logger.add_entry(f"[{witch_agent.name} 回复-毒药]: {raw_response}")
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(witch_agent)
+            game_logger.add_entry(f"[{witch_agent.name} 女巫毒药回复 - {model_info}]: {raw_response}")
 
             target_name = None
             parsed_name = ""
@@ -782,7 +857,15 @@ class GameMasterAgent(ReActAgent):
 
         # 3. 在公布死亡后，处理遗言
         if dead_players_data:
-            await self._handle_last_words(dead_players_data)
+            # 【新增】遗言规则：首夜死亡有遗言，第二夜及之后的夜晚死亡无遗言
+            if self.game_state["day"] == 1:
+                # 首夜死亡，有遗言
+                await self._handle_last_words(dead_players_data)
+            else:
+                # 第二夜及之后，夜晚死亡无遗言
+                game_logger.add_entry(f"[遗言规则]: 第{self.game_state['day']}夜死亡的玩家无遗言权")
+                await self._announce_to_public("根据游戏规则，第二夜及之后的夜晚死亡玩家无遗言。", role="system", to_print=True)
+            
             # 遗言后可能产生胜负
             if self.game_state["game_over"]:
                 return
@@ -800,9 +883,10 @@ class GameMasterAgent(ReActAgent):
         for player_data in sorted(alive_players_data, key=lambda p: p['agent'].name):
             agent = player_data["agent"]
             
-            # 【修复】在发言前为该玩家生成记忆摘要（串行，避免限流）
-            memory_summary = await self._generate_memory_summary(agent.name)
-            game_logger.add_entry(f"[为 {agent.name} 生成的记忆摘要]: {memory_summary}")
+            # 【修复】在白天发言前为该玩家生成记忆摘要
+            # 白天发言前的摘要应该只包含昨晚的死亡和遗言等信息
+            memory_summary = await self._generate_memory_summary(agent.name, for_morning=True)
+            game_logger.add_entry(f"[白天发言前-为 {agent.name} 生成的记忆摘要]: {memory_summary}")
 
             # 【Prompt优化】为AI构建更丰富的上下文
             current_day = self.game_state['day']
@@ -812,7 +896,7 @@ class GameMasterAgent(ReActAgent):
             private_info = "你是一个普通村民，没有特殊信息。"
             if player_role == "seer":
                 # 预言家可以看到自己的查验历史
-                seer_history = [log for log in self.game_state["full_history"] if "预言家查验了" in log and agent.name in log]
+                seer_history = [log for log in self.game_state["full_history"] if "查验了" in log and agent.name in log]
                 if seer_history:
                     private_info = "你的查验历史如下：\n" + "\n".join(seer_history)
                 else:
@@ -823,10 +907,20 @@ class GameMasterAgent(ReActAgent):
                 private_info = f"你的药剂状态：解药[{save_status}]，毒药[{poison_status}]。"
             elif player_role == "werewolf":
                 werewolf_teammates = [p_name for p_name, p_role in self.game_state["identities"].items() if p_role == "werewolf" and p_name != agent.name]
+                teammates_info = ""
                 if werewolf_teammates:
-                    private_info = f"你的狼人队友是: {', '.join(werewolf_teammates)}。"
+                    teammates_info = f"你的狼人队友是: {', '.join(werewolf_teammates)}。\n"
                 else:
-                    private_info = "你的狼人队友已经死亡，你现在是唯一的狼人。"
+                    teammates_info = "你的狼人队友已经死亡，你现在是唯一的狼人。\n"
+                
+                # 【新增】狼人击杀历史
+                werewolf_history = [log for log in self.game_state["full_history"] if "狼人团队决定淘汰" in log or "狼人代表未能提供有效目标" in log]
+                if werewolf_history:
+                    kill_history = "你们的击杀历史如下：\n" + "\n".join(werewolf_history)
+                else:
+                    kill_history = "你们还没有执行任何击杀行动。"
+                
+                private_info = teammates_info + kill_history
 
             # 2. 构建完整的Prompt
             alive_players_str = ", ".join([p["agent"].name for p in alive_players_data])
@@ -867,27 +961,47 @@ class GameMasterAgent(ReActAgent):
             cleaned_content = raw_response
             if not getattr(agent, 'is_user', False):
                 # 【修复】更智能地移除思考过程，保留完整发言
-                parts = cleaned_content.split(f"{agent.name}:")
-                if len(parts) > 1:
-                    # 如果模型按 "思考... Player_X: 发言..." 格式回复，取最后一部分
-                    cleaned_content = parts[-1].strip()
-                else:
-                    # 否则，只在第一段明确是思考过程时才移除它
-                    paragraphs = [p.strip() for p in cleaned_content.split('\n\n') if p.strip()]
-                    if len(paragraphs) > 1:
-                        first_para = paragraphs[0].lower()
-                        thinking_keywords = ['thinking', 'strategy', '策略', '分析：', '我的想法是']
-                        if any(keyword in first_para for keyword in thinking_keywords):
-                            cleaned_content = "\n\n".join(paragraphs[1:])
+                
+                # 首先移除明确的思考标记
+                cleaned_content = re.sub(r"^\(thinking\):", "", cleaned_content, flags=re.IGNORECASE).strip()
+                
+                # 处理可能的格式："思考过程... Player_X: 实际发言内容"
+                if f"{agent.name}:" in cleaned_content:
+                    parts = cleaned_content.split(f"{agent.name}:")
+                    if len(parts) > 1:
+                        # 检查分割后的第一部分是否主要是思考内容
+                        first_part = parts[0].strip().lower()
+                        thinking_indicators = ['thinking', 'strategy', '策略', '分析', '我需要', '考虑', '想法', 'player_' + agent.split('_')[1] + '(thinking)']
+                        
+                        # 如果第一部分包含大量思考关键词，或明显是思考过程，则移除
+                        if (len(first_part) > 100 and any(indicator in first_part for indicator in thinking_indicators)) or \
+                           '(thinking)' in first_part:
+                            # 取最后一个 "Player_X:" 之后的内容
+                            cleaned_content = parts[-1].strip()
                         else:
-                            cleaned_content = "\n\n".join(paragraphs) # 如果第一段不是思考，则保留全部
+                            # 否则保留完整内容，只是去掉重复的玩家名前缀
+                            cleaned_content = f"{agent.name}:" + ":".join(parts[1:])
+                            cleaned_content = cleaned_content.replace(f"{agent.name}:", "", 1).strip()
+                
+                # 处理段落级别的思考内容移除
+                paragraphs = [p.strip() for p in cleaned_content.split('\n\n') if p.strip()]
+                if len(paragraphs) > 1:
+                    first_para = paragraphs[0].lower()
+                    thinking_keywords = ['thinking', 'strategy', '策略', '分析：', '我的想法是', '我需要考虑', '当前局面']
+                    # 只有当第一段明确是思考内容且较长时才移除
+                    if len(first_para) > 80 and any(keyword in first_para for keyword in thinking_keywords):
+                        cleaned_content = "\n\n".join(paragraphs[1:])
                     else:
                         cleaned_content = "\n\n".join(paragraphs)
-                
-                cleaned_content = re.sub(r"^\(thinking\):", "", cleaned_content, flags=re.IGNORECASE).strip()
+                else:
+                    cleaned_content = "\n\n".join(paragraphs)
 
             # 记录并广播发言
             speech = f"玩家 {agent.name} 说: {cleaned_content}"
+            
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(agent)
+            game_logger.add_entry(f"[{agent.name} 发言 - {model_info}]: {cleaned_content}")
             
             # 【修复】手动打印处理干净的发言
             print(speech)
@@ -904,7 +1018,7 @@ class GameMasterAgent(ReActAgent):
 
     async def _vote_phase(self) -> None:
         self.game_state["phase"] = "VOTE"
-        await self._announce_to_public("现在进入投票环节。请投票选出你认为的狼人。", role="system")
+        await self._announce_to_public("现在进入投票环节。请投票选出你认为的狼人。若无明确选择，可以输入 '弃票' 表示本轮弃票。", role="system")
 
         alive_players_data = self._get_alive_players_by_role()
         potential_targets = [p["agent"].name for p in alive_players_data]
@@ -989,7 +1103,8 @@ class GameMasterAgent(ReActAgent):
         if getattr(voter, 'is_user', False):
             # 针对人类玩家的优化输入
             while target_name is None:
-                prompt = (f"请从以下玩家中投票选择一人淘汰：\n{', '.join(potential_targets)}\n请输入你要投票的玩家姓名或编号：")
+                prompt = (f"请从以下玩家中投票选择一人淘汰：\n{', '.join(potential_targets)}\n"
+                          f"请输入你要投票的玩家姓名或编号；若无明确选择，请输入 '弃票' / 'abstain' 表示弃票：")
                 response_msg = await voter.reply(Msg(self.name, prompt, role="user"))
                 user_input = response_msg.content.strip().lower() if response_msg.content else ""
 
@@ -1002,6 +1117,10 @@ class GameMasterAgent(ReActAgent):
                         target_name = p_target
                         break
                 
+                # 支持弃票
+                if not target_name and user_input in ['弃票','abstain','pass','skip','不投','不投票']:
+                    return voter.name, None
+
                 if not target_name:
                     await voter.observe(Msg(self.name, "无效的输入，请重新输入。", role="system"))
             
@@ -1016,7 +1135,7 @@ class GameMasterAgent(ReActAgent):
             # 1. 构建私密信息部分 (与发言环节逻辑相同)
             private_info = "你是一个普通村民，没有特殊信息。"
             if player_role == "seer":
-                seer_history = [log for log in self.game_state["full_history"] if "预言家查验了" in log and voter.name in log]
+                seer_history = [log for log in self.game_state["full_history"] if "查验了" in log and voter.name in log]
                 if seer_history:
                     private_info = "你的查验历史如下：\n" + "\n".join(seer_history)
                 else:
@@ -1027,10 +1146,20 @@ class GameMasterAgent(ReActAgent):
                 private_info = f"你的药剂状态：解药[{save_status}]，毒药[{poison_status}]。"
             elif player_role == "werewolf":
                 werewolf_teammates = [p_name for p_name, p_role in self.game_state["identities"].items() if p_role == "werewolf" and p_name != voter.name]
+                teammates_info = ""
                 if werewolf_teammates:
-                    private_info = f"你的狼人队友是: {', '.join(werewolf_teammates)}。"
+                    teammates_info = f"你的狼人队友是: {', '.join(werewolf_teammates)}。\n"
                 else:
-                    private_info = "你的狼人队友已经死亡，你现在是唯一的狼人。"
+                    teammates_info = "你的狼人队友已经死亡，你现在是唯一的狼人。\n"
+                
+                # 【新增】狼人击杀历史
+                werewolf_history = [log for log in self.game_state["full_history"] if "狼人团队决定淘汰" in log or "狼人代表未能提供有效目标" in log]
+                if werewolf_history:
+                    kill_history = "你们的击杀历史如下：\n" + "\n".join(werewolf_history)
+                else:
+                    kill_history = "你们还没有执行任何击杀行动。"
+                
+                private_info = teammates_info + kill_history
             
             # 2. 构建完整的Prompt
             discussion_summary = "\n".join(self.game_state["discussion_history"])
@@ -1043,7 +1172,8 @@ class GameMasterAgent(ReActAgent):
                       f"=== 今天白天的发言回顾 ===\n{discussion_summary}\n\n"
                       f"=== 你的任务 ===\n"
                       f"根据以上所有信息，从下列存活玩家中投票淘汰一人：\n[{', '.join(potential_targets)}]\n"
-                      f"你的回复必须严格遵循 '我投票给: [玩家姓名]' 的格式，不要包含任何其他内容或思考过程。")
+                      f"你的回复必须严格遵循 '我投票给: [玩家姓名]' 的格式，不要包含任何其他内容或思考过程。\n"
+                      f"如果你想弃票，请仅回复：弃票。")
 
             # 增加重试逻辑
             for attempt in range(2): # 最多尝试2次
@@ -1057,7 +1187,15 @@ class GameMasterAgent(ReActAgent):
                     # 【修复】使用新的健壮解析函数
                     raw_response = self._parse_ai_response(response_msg.content)
                     
-                    game_logger.add_entry(f"[{voter.name} 原始投票回复 (尝试 {attempt + 1})]: {raw_response}")
+                    # 【新增】获取模型信息并记录到日志
+                    model_info = self._get_agent_model_info(voter)
+                    game_logger.add_entry(f"[{voter.name} 投票回复 (尝试 {attempt + 1}) - {model_info}]: {raw_response}")
+
+                    # 解析是否为弃票（支持多种同义词）
+                    normalized = raw_response.strip().lower() if raw_response else ""
+                    if any(token in normalized for token in ['弃票','abstain','pass','skip','不投','不投票']):
+                        game_logger.add_entry(f"[{voter.name} 弃票]")
+                        return voter.name, None
 
                     # 【最终修复方案】采用最稳健的解析方式：直接在原始回复中搜索有效的玩家名字
                     # 从后向前搜索，以正确匹配 Player_10 而不是 Player_1
@@ -1093,7 +1231,7 @@ class GameMasterAgent(ReActAgent):
                 # 构建私密信息
                 private_info = "你是一个普通村民，没有特殊信息。"
                 if player_role == "seer":
-                    seer_history = [log for log in self.game_state["full_history"] if "预言家查验了" in log and agent.name in log]
+                    seer_history = [log for log in self.game_state["full_history"] if "查验了" in log and agent.name in log]
                     if seer_history:
                         private_info = "你的查验历史如下：\n" + "\n".join(seer_history)
                     else:
@@ -1105,10 +1243,39 @@ class GameMasterAgent(ReActAgent):
                 elif player_role == "werewolf":
                     werewolf_teammates = [p_name for p_name, p_role in self.game_state["identities"].items() if p_role == "werewolf" and p_name != agent.name]
                     teammates_status = [f"{name}({self.game_state['players'][name]['status']})" for name in werewolf_teammates]
+                    teammates_info = ""
                     if werewolf_teammates:
-                        private_info = f"你的狼人队友状态: {', '.join(teammates_status)}。"
+                        teammates_info = f"你的狼人队友状态: {', '.join(teammates_status)}。\n"
                     else:
-                        private_info = "你是唯一的狼人。"
+                        teammates_info = "你是唯一的狼人。\n"
+                    
+                    # 【新增】狼人击杀历史
+                    werewolf_history = [log for log in self.game_state["full_history"] if "狼人团队决定淘汰" in log or "狼人代表未能提供有效目标" in log]
+                    if werewolf_history:
+                        kill_history = "你们的击杀历史如下：\n" + "\n".join(werewolf_history)
+                    else:
+                        kill_history = "你们还没有执行任何击杀行动。"
+                    
+                    private_info = teammates_info + kill_history
+
+                # 根据身份动态构建任务说明
+                task_instruction = ""
+                if player_role == "werewolf":
+                    # 狼人遗言：只提示可以继续迷惑
+                    task_instruction = (
+                        f"请综合以上所有信息，发表你的最后一段发言。\n"
+                        f"{'注意：你是第一天晚上被淘汰的，没有任何游戏信息，请基于你的身份和推测合理发言。' if self.game_state['day'] == 1 else ''}"
+                        f"请尽量隐藏自己和队友的身份，你可以继续迷惑好人，为你的队友争取优势。\n"
+                        f"请直接给出你的发言，不要包含任何思考过程。"
+                    )
+                else:
+                    # 好人阵营遗言：只提示为好人阵营提供帮助
+                    task_instruction = (
+                        f"请综合以上所有信息，发表你的最后一段发言。\n"
+                        f"{'注意：你是第一天晚上被淘汰的，没有任何游戏信息，请基于你的身份和推测合理发言。' if self.game_state['day'] == 1 else ''}"
+                        f"请尽力为好人阵营提供有价值的线索和分析。\n"
+                        f"请直接给出你的发言，不要包含任何思考过程。"
+                    )
 
                 prompt = (
                     f"你已经被淘汰了。现在是第 {self.game_state['day']} 天的遗言环节。\n"
@@ -1117,11 +1284,7 @@ class GameMasterAgent(ReActAgent):
                     f"=== 游戏至今的记忆摘要 ===\n{memory_summary if memory_summary else '(第一天没有历史信息)'}\n\n"
                     f"=== 导致你出局的当天发言回顾 ===\n{discussion_summary if discussion_summary else '(第一天晚上被淘汰，没有发言记录)'}\n\n"
                     f"=== 你的任务 ===\n"
-                    f"请综合以上所有信息，发表你的最后一段发言。\n"
-                    f"{'注意：你是第一天晚上被淘汰的，没有任何游戏信息，请基于你的身份和推测合理发言。' if self.game_state['day'] == 1 else ''}"
-                    f"如果你是好人，请尽力为好人阵营提供有价值的线索和分析。\n"
-                    f"如果你是狼人，可以继续迷惑好人，为你的队友争取优势。\n"
-                    f"请直接给出你的发言，不要包含任何思考过程。"
+                    f"{task_instruction}"
                 )
 
             # 【修复】统一使用静默回复，并为遗言环节增加超时
@@ -1139,29 +1302,51 @@ class GameMasterAgent(ReActAgent):
             # 【修复】使用新的健壮解析函数
             raw_response = self._parse_ai_response(response_msg.content)
 
-            # 【修复】同样对遗言进行后处理
+            # 【修复】同样对遗言进行后处理，与发言逻辑保持一致
             cleaned_content = raw_response
             if not getattr(agent, 'is_user', False):
                 # 【修复】更智能地移除思考过程，保留完整发言
-                parts = cleaned_content.split(f"{agent.name}:")
-                if len(parts) > 1:
-                    cleaned_content = parts[-1].strip()
-                else:
-                    paragraphs = [p.strip() for p in cleaned_content.split('\n\n') if p.strip()]
-                    if len(paragraphs) > 1:
-                        first_para = paragraphs[0].lower()
-                        thinking_keywords = ['thinking', 'strategy', '策略', '分析：', '我的想法是']
-                        if any(keyword in first_para for keyword in thinking_keywords):
-                            cleaned_content = "\n\n".join(paragraphs[1:])
+                
+                # 首先移除明确的思考标记
+                cleaned_content = re.sub(r"^\(thinking\):", "", cleaned_content, flags=re.IGNORECASE).strip()
+                
+                # 处理可能的格式："思考过程... Player_X: 实际遗言内容"
+                if f"{agent.name}:" in cleaned_content:
+                    parts = cleaned_content.split(f"{agent.name}:")
+                    if len(parts) > 1:
+                        # 检查分割后的第一部分是否主要是思考内容
+                        first_part = parts[0].strip().lower()
+                        thinking_indicators = ['thinking', 'strategy', '策略', '分析', '我需要', '考虑', '想法', 'player_' + agent.name.split('_')[1] + '(thinking)']
+                        
+                        # 如果第一部分包含大量思考关键词，或明显是思考过程，则移除
+                        if (len(first_part) > 100 and any(indicator in first_part for indicator in thinking_indicators)) or \
+                           '(thinking)' in first_part:
+                            # 取最后一个 "Player_X:" 之后的内容
+                            cleaned_content = parts[-1].strip()
                         else:
-                            cleaned_content = "\n\n".join(paragraphs)
+                            # 否则保留完整内容，只是去掉重复的玩家名前缀
+                            cleaned_content = f"{agent.name}:" + ":".join(parts[1:])
+                            cleaned_content = cleaned_content.replace(f"{agent.name}:", "", 1).strip()
+                
+                # 处理段落级别的思考内容移除
+                paragraphs = [p.strip() for p in cleaned_content.split('\n\n') if p.strip()]
+                if len(paragraphs) > 1:
+                    first_para = paragraphs[0].lower()
+                    thinking_keywords = ['thinking', 'strategy', '策略', '分析：', '我的想法是', '我需要考虑', '当前局面']
+                    # 只有当第一段明确是思考内容且较长时才移除
+                    if len(first_para) > 80 and any(keyword in first_para for keyword in thinking_keywords):
+                        cleaned_content = "\n\n".join(paragraphs[1:])
                     else:
                         cleaned_content = "\n\n".join(paragraphs)
-
-                cleaned_content = re.sub(r"^\(thinking\):", "", cleaned_content, flags=re.IGNORECASE).strip()
+                else:
+                    cleaned_content = "\n\n".join(paragraphs)
 
             # 广播遗言
             last_words = f"玩家 {agent.name} 的遗言是：{cleaned_content}"
+            
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(agent)
+            game_logger.add_entry(f"[{agent.name} 遗言 - {model_info}]: {cleaned_content}")
             
             # 【修复】手动打印处理干净的遗言
             print(last_words)
@@ -1195,6 +1380,9 @@ class GameMasterAgent(ReActAgent):
         alive_players_data = self._get_alive_players_by_role()
         potential_targets = [p["agent"].name for p in alive_players_data]
         
+        # 【调试】显示可选目标
+        game_logger.add_entry(f"[猎人开枪]: 可选目标列表 = {potential_targets}")
+        
         if not potential_targets:
             return
         
@@ -1210,11 +1398,12 @@ class GameMasterAgent(ReActAgent):
             f"=== 你的任务 ===\n"
             f"请从以下存活玩家中选择一人开枪带走：\n{', '.join(potential_targets)}\n"
             f"综合考虑所有信息，选择你认为最可能是狼人的玩家。\n"
-            f"请以'我开枪带走: [玩家姓名]'的格式回复。"
+            f"请以'我开枪带走: [玩家姓名]'的格式回复。若不想开枪请输入 '弃票'。"
         )
         
         if getattr(hunter_agent, 'is_user', False):
-            prompt = f"你是猎人，可以开枪带走一名玩家。请从以下玩家中选择：\n{', '.join(potential_targets)}\n请输入你要开枪带走的玩家姓名或编号："
+            prompt = f"你是猎人，可以开枪带走一名玩家。请从以下玩家中选择：\n{', '.join(potential_targets)}\n"
+            prompt += "请输入你要开枪带走的玩家姓名或编号；若不想开枪请输入 '弃票'。"
         
         for attempt in range(3):  # 最多尝试3次
             prompt_logger.add_prompt(
@@ -1224,30 +1413,75 @@ class GameMasterAgent(ReActAgent):
             
             response_msg = await self._get_silent_reply(hunter_agent, prompt)
             raw_response = self._parse_ai_response(response_msg.content)
-            game_logger.add_entry(f"[{dead_player_name} 开枪回复 (尝试 {attempt + 1})]: {raw_response}")
             
-            # 解析目标
-            parsed_name = raw_response
-            if "我开枪带走:" in raw_response or "我开枪带走：" in raw_response:
-                parsed_name = raw_response.split(":")[-1].split("：")[-1].strip()
+            # 【新增】获取模型信息并记录到日志
+            model_info = self._get_agent_model_info(hunter_agent)
+            game_logger.add_entry(f"[{dead_player_name} 猎人开枪回复 (尝试 {attempt + 1}) - {model_info}]: {raw_response}")
             
+            # 解析目标：支持直接命中、格式化的 '我开枪带走: Player_X'，以及嵌套JSON或被引号包裹的情况
+            parsed_candidate = raw_response.strip() if raw_response else ""
+            # 处理可能的 JSON 字符串或转义
+            try:
+                import json
+                # 如果是被额外引号包裹的 JSON 字符串，先去掉外部引号并解码转义
+                if parsed_candidate.startswith('"') and parsed_candidate.endswith('"'):
+                    inner = parsed_candidate[1:-1]
+                    try:
+                        parsed_candidate = inner.encode('utf-8').decode('unicode_escape')
+                    except Exception:
+                        parsed_candidate = inner
+                # 尝试解析 JSON，提取可能的字段
+                if parsed_candidate.startswith('{') or '"response"' in parsed_candidate:
+                    parsed_json = json.loads(parsed_candidate)
+                    if isinstance(parsed_json, dict):
+                        # 优先使用常见字段
+                        parsed_candidate = parsed_json.get('response') or parsed_json.get('content') or next(iter(parsed_json.values()), parsed_candidate)
+            except Exception:
+                # 解析失败则继续使用原始文本
+                pass
+            
+            # 如果包含格式化指令，提取冒号后的部分
+            if '我开枪带走:' in parsed_candidate or '我开枪带走：' in parsed_candidate:
+                parsed_candidate = parsed_candidate.split(':')[-1].split('：')[-1].strip()
+            
+            # 【调试】记录解析过程
+            game_logger.add_entry(f"[猎人开枪解析]: 原始回复='{raw_response}', 处理后='{parsed_candidate}'")
+            
+            # 检查是否为弃票
+            norm = parsed_candidate.strip().lower()
+            if any(tok in norm for tok in ['弃票','abstain','pass','skip','不想','不投']):
+                game_logger.add_entry(f"[{dead_player_name} 弃枪]")
+                return
+            
+            # 增强匹配逻辑，支持更多格式
             for p_target in potential_targets:
                 player_id = p_target.split('_')[-1]
-                if parsed_name.lower() == p_target.lower() or \
-                   parsed_name.lower() == f"player{player_id}" or \
-                   parsed_name.lower() == f"player {player_id}" or \
-                   parsed_name.lower() == player_id or \
-                   parsed_name in p_target:
+                normalized_input = parsed_candidate.lower().strip()
+                
+                # 支持的格式：Player_6, player_6, player6, player 6, 6
+                if normalized_input == p_target.lower() or \
+                   normalized_input == f"player_{player_id}" or \
+                   normalized_input == f"player{player_id}" or \
+                   normalized_input == f"player {player_id}" or \
+                   normalized_input == f"player-{player_id}" or \
+                   normalized_input == player_id or \
+                   p_target.lower() in normalized_input:
                     target_name = p_target
+                    game_logger.add_entry(f"[猎人开枪匹配成功]: '{normalized_input}' 匹配到 '{p_target}'")
                     break
             
+            # 如果上面没匹配到，再检查是否直接在原始输入中出现目标名
+            if not target_name:
+                for p_target in sorted(potential_targets, key=len, reverse=True):
+                    if p_target in raw_response:
+                        target_name = p_target
+                        game_logger.add_entry(f"[猎人开枪备用匹配成功]: 在原始回复中找到 '{p_target}'")
+                        break
+            
+            # 【关键修复】如果找到了有效目标，立即跳出外层循环
             if target_name:
+                game_logger.add_entry(f"[猎人开枪]: 找到有效目标 '{target_name}'，停止尝试")
                 break
-            else:
-                error_msg = "无效的目标，请重新选择。"
-                await hunter_agent.observe(Msg(self.name, error_msg, role="system"))
-                if getattr(hunter_agent, 'is_user', False):
-                    print(error_msg)
         
         if target_name:
             self.game_state["players"][target_name]["status"] = "dead"
@@ -1256,15 +1490,28 @@ class GameMasterAgent(ReActAgent):
             game_logger.add_entry(log_entry)
             await self._announce_to_public(log_entry, role="system", to_print=True)
             
-            # 被枪杀的玩家也有遗言
+            # 被枪杀的玩家的遗言处理
             shot_player_data = self.game_state["players"][target_name]
-            await self._handle_last_words([shot_player_data])
+            
+            # 【新增】判断猎人开枪时的遗言规则
+            # 如果是第二夜及之后，且触发开枪的猎人是因夜晚死亡，则被带走的玩家无遗言
+            # 如果是首夜或白天投票死亡触发的猎人开枪，则被带走的玩家有遗言
+            hunter_death_cause = self.game_state["night_info"]["death_cause"].get(dead_player_name)
+            
+            if self.game_state["day"] >= 2 and hunter_death_cause in ["werewolf", "poison"]:
+                # 第二夜及之后，因夜晚死亡的猎人开枪带走的玩家无遗言
+                game_logger.add_entry(f"[遗言规则]: {target_name} 被夜晚死亡的猎人带走，无遗言权")
+                await self._announce_to_public(f"根据游戏规则，{target_name} 被夜晚死亡的猎人带走，无遗言。", role="system", to_print=True)
+            else:
+                # 首夜死亡或白天投票死亡触发的猎人开枪，被带走的玩家有遗言
+                await self._handle_last_words([shot_player_data])
             
             # 如果被枪杀的也是猎人，形成连锁反应（递归调用）
             # 注意：为防止无限递归，实际规则中通常猎人被猎人枪杀不能再开枪
             # 这里我们采用标准规则：被猎人枪杀的猎人不能再开枪
         else:
             # 如果多次都无法给出有效目标，随机选择
+            game_logger.add_entry(f"[猎人开枪匹配失败]: 3次尝试都未能匹配到有效目标")
             fallback_target = random.choice(potential_targets)
             self.game_state["players"][fallback_target]["status"] = "dead"
             log_entry = f"猎人 {dead_player_name} 未能提供有效目标，裁判随机选择了 {fallback_target}。"
@@ -1323,7 +1570,7 @@ class GameMasterAgent(ReActAgent):
         for name, data in self.game_state["players"].items():
             if data["status"] == "alive":
                 if not roles or self.game_state["identities"][name] in roles:
-                    alive_players.append(data)
+                                       alive_players.append(data)
         return alive_players
         
     # async def reply(self, x: Msg = None) -> Msg:
@@ -1346,31 +1593,74 @@ class GameMasterAgent(ReActAgent):
         """
         pass
 
-    async def _generate_memory_summary(self, player_name: str) -> str:
+    async def _update_all_players_memory_for_night(self) -> None:
+        """
+        【新增】在夜晚开始前为所有存活玩家更新记忆摘要。
+        确保夜晚行动时能获取到完整的上一天信息（发言、投票、遗言、猎人开枪等）。
+        """
+        alive_players_data = self._get_alive_players_by_role()
+        
+        for player_data in alive_players_data:
+            player_name = player_data["agent"].name
+            try:
+                # 为每个玩家生成最新的记忆摘要
+                await self._generate_memory_summary(player_name)
+                game_logger.add_entry(f"[夜晚前更新记忆]: 为 {player_name} 更新记忆摘要完成")
+            except Exception as e:
+                game_logger.add_entry(f"[夜晚前更新记忆失败]: {player_name} - {e}")
+
+    async def _generate_memory_summary(self, player_name: str, for_morning: bool = False) -> str:
         """【逻辑重构】实现增量式记忆摘要"""
         player_data = self.game_state["players"][player_name]
         previous_summary = player_data.get("memory_summary", "这是游戏的初始阶段，还没有历史记忆。")
 
-        # 提取当天的游戏记录
+        # 【修复】根据调用场景确定需要包含的事件范围
         current_day = self.game_state['day']
-        todays_events = [
-            log for log in self.game_state["full_history"] 
-            if f"[第{current_day}天" in log
-        ]
         
-        if not todays_events:
-            # 如果当天还没有任何事件，直接返回上一份摘要
+        # 如果是第一天，或者之前没有摘要，则从游戏开始整理
+        if current_day == 1 or previous_summary == "这是游戏的初始阶段，还没有历史记忆。":
+            # 第一天：收集所有历史事件
+            new_events = self.game_state["full_history"]
+            context_desc = "游戏开始至今的所有事件"
+        elif for_morning:
+            # 【新增】白天发言前：只包含昨晚的事件（夜晚死亡、遗言等）
+            yesterday = current_day - 1
+            new_events = [
+                log for log in self.game_state["full_history"] 
+                if f"[第{yesterday}天-夜晚]" in log or f"[第{yesterday}天-遗言]" in log or f"[第{yesterday}天-猎人开枪]" in log
+            ]
+            context_desc = f"第{yesterday}天夜晚发生的事件"
+        else:
+            # 夜晚前：收集当天完整的白天信息（发言、投票、遗言等）
+            new_events = [
+                log for log in self.game_state["full_history"] 
+                if f"[第{current_day}天" in log
+            ]
+            context_desc = f"第{current_day}天已发生的事件"
+        
+        if not new_events:
+            # 如果没有新事件，直接返回上一份摘要
             return previous_summary
 
-        todays_events_str = "\n".join(todays_events)
+        # 【关键修复】确保包含所有关键事件类型
+        important_events = []
+        for event in new_events:
+            # 过滤重要事件：发言、投票、淘汰、遗言、猎人开枪、夜晚死亡
+            if any(keyword in event for keyword in [
+                "发言", "投票", "被淘汰", "遗言", "猎人开枪", "被淘汰了", 
+                "预言家查验", "女巫", "触发开枪技能", "开枪带走"
+            ]):
+                important_events.append(event)
+        
+        events_str = "\n".join(important_events) if important_events else "\n".join(new_events)
 
         prompt = (
-            f"你是一名狼人杀游戏的中立记录员。你的任务是根据昨天的记忆摘要和今天发生的新事件，生成一份更新后的、简洁的全局回顾。\n"
-            f"回顾应严格遵循事实，按时间顺序或关键事件（如投票、淘汰、重要发言）来组织。\n"
+            f"你是一名狼人杀游戏的中立记录员。你的任务是根据以往记忆和新发生的事件，生成一份更新后的、简洁的全局回顾。\n"
+            f"回顾应严格遵循事实，按时间顺序或关键事件（如投票、淘汰、重要发言、猎人开枪）来组织。\n"
             f"请不要包含任何主观分析、猜测或行动建议。\n"
-            f"请将新旧信息整合成一个连贯的、不超过200字的摘要。\n\n"
-            f"=== 截止到昨天的记忆 ===\n{previous_summary}\n\n"
-            f"=== 今天发生的新事件 ===\n{todays_events_str}\n\n"
+            f"请将新旧信息整合成一个连贯的、不超过350字的摘要。\n\n"
+            f"=== 以往记忆 ===\n{previous_summary}\n\n"
+            f"=== {context_desc} ===\n{events_str}\n\n"
             f"=== 你的客观回顾（更新版） ==="
         )
         
@@ -1381,7 +1671,7 @@ class GameMasterAgent(ReActAgent):
                 prompt=prompt
             )
             # 【修改】使用专门的摘要模型而不是裁判的主模型
-            # 创建一个临时的"摘要生成器"来调用摘要模型
+            # 创建一个临时的"摘要生成代理"，使用摘要模型
             new_summary = await self._call_summary_model(prompt)
             
             # 更新该玩家的记忆状态
@@ -1395,7 +1685,7 @@ class GameMasterAgent(ReActAgent):
     def _get_player_memory(self, player_name: str) -> str:
         """【优化】统一获取玩家记忆摘要的辅助函数"""
         return self.game_state["players"][player_name].get("memory_summary", "这是游戏的初始阶段，还没有历史记忆。")
-    
+
     async def _call_summary_model(self, prompt: str) -> str:
         """
         调用专门的摘要模型生成摘要。
