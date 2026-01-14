@@ -30,7 +30,7 @@ class GameLogger:
             os.makedirs(log_dir)
         
         with open(os.path.join(log_dir, self.log_filename), "a", encoding="utf-8") as f:
-            f.write(entry + "\n")
+            f.write(entry + "\n\n")  # 每条日志后加空行
 
     def log_identities_at_end(self, identities: Dict[str, str]):
         """在游戏结束时记录所有玩家的最终身份。"""
@@ -45,6 +45,48 @@ class GameLogger:
 
 # 创建一个全局的logger实例，方便在其他模块中导入和使用
 game_logger = GameLogger()
+
+
+class MemoryLogger:
+    """专门用于记录夜晚前更新记忆的日志记录器。"""
+    def __init__(self) -> None:
+        self.log_filename = ""
+
+    def start_logging(self) -> None:
+        """初始化日志文件."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_filename = f"prompt_night_{timestamp}.txt"
+        
+        # 确保logs目录存在
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+    def add_memory_update(self, player_name: str, prompt: str, summary: str) -> None:
+        """
+        记录一次记忆更新。
+
+        Args:
+            player_name (str): 玩家名称
+            prompt (str): 发送给摘要模型的完整prompt
+            summary (str): 生成的摘要结果
+        """
+        if not self.log_filename:
+            self.start_logging()
+            
+        log_dir = "logs"
+        log_entry = (
+            f"===== 为 {player_name} 更新记忆摘要 =====\n"
+            f"【提示词】\n{prompt}\n\n"
+            f"【生成的摘要】\n{summary}\n"
+            f"===== END =====\n\n"
+        )
+        
+        with open(os.path.join(log_dir, self.log_filename), "a", encoding="utf-8") as f:
+            f.write(log_entry)
+
+# 创建一个全局的memory logger实例
+memory_logger = MemoryLogger()
 
 
 class PromptLogger:

@@ -13,7 +13,7 @@ from agentscope.pipeline import MsgHub
 from collections import Counter
 import random
 import re
-from logger import game_logger, prompt_logger # 【新功能】引入prompt_logger
+from logger import game_logger, prompt_logger, memory_logger # 【新功能】引入prompt_logger和memory_logger
 from agentscope.formatter import OpenAIMultiAgentFormatter
 
 # 角色中英文映射
@@ -208,10 +208,7 @@ class GameMasterAgent(ReActAgent):
         game_logger.add_entry(log_entry)
         await self._announce_to_public("天黑请闭眼...", role="system", to_print=True)
         
-        # 【新增】在夜晚行动前，为所有存活玩家更新记忆摘要
-        # 确保他们能获取到完整的上一天信息（发言、投票、遗言、猎人开枪等）
-        if self.game_state['day'] > 1:  # 第一天晚上不需要更新，因为还没有白天发言
-            await self._update_all_players_memory_for_night()
+        # 记忆已经在投票阶段结束后更新了，这里不需要再更新
         
         # 1. 狼人行动
         await self._werewolf_action()
@@ -454,7 +451,7 @@ class GameMasterAgent(ReActAgent):
         return cleaned_text.strip()
 
     async def _werewolf_action(self) -> None:
-        """处理狼人讨论和刀人的逻辑（问答模式）"""
+        """处理狼人讨论和刀人的逻辑（包含2轮讨论 + 最终决策）"""
         await self._announce_to_public("狼人请睁眼，商量要淘汰的玩家。", role="system", to_print=True)
         
         alive_werewolves_data = self._get_alive_players_by_role("werewolf")
@@ -462,7 +459,7 @@ class GameMasterAgent(ReActAgent):
             return
 
         alive_werewolves_agents = [data["agent"] for data in alive_werewolves_data]
-        coordinator_wolf = alive_werewolves_agents[0] # 指定第一个狼人作为协调者
+        coordinator_wolf = alive_werewolves_agents[0]  # 指定第一个狼人作为最终决策者
 
         potential_targets = [
             p_name for p_name, p_info in self.game_state["players"].items()
@@ -471,13 +468,10 @@ class GameMasterAgent(ReActAgent):
         if not potential_targets:
             return
 
-        # 1. 向所有狼人广播任务，同步信息
-        broadcast_prompt = (f"你们是狼人团队。现在是夜晚，可淘汰的玩家列表如下：\n"
-                            f"{', '.join(potential_targets)}\n"
-                            f"由 {coordinator_wolf.name} 作为代表，向我（裁判）汇报最终决定。")
-        await self.werewolf_channel.broadcast(Msg(self.name, broadcast_prompt, role="system"))
+        # 【新增】狼人讨论阶段（2轮）
+        discussion_history = await self._werewolf_discussion(alive_werewolves_agents, potential_targets)
 
-        # 2. 【优化】获取协调者狼人的记忆摘要
+        # 最终决策阶段：由协调者综合讨论做出决定
         memory_summary = self._get_player_memory(coordinator_wolf.name)
         
         # 3. 构建狼人队友信息
@@ -496,13 +490,24 @@ class GameMasterAgent(ReActAgent):
 
         # 4. 直接向协调者提问，并等待其回复，同时注入上下文
         target_name = None
+        
+        # 构建讨论内容展示（如果进行了讨论）
+        discussion_summary = ""
+        if discussion_history:
+            discussion_content = "\n".join(discussion_history)
+            discussion_summary = (
+                f"\n=== 刚才的讨论记录 ===\n"
+                f"{discussion_content}\n"
+            )
+        
         prompt_to_coordinator = (
             f"你是 {coordinator_wolf.name}，你的身份是【{ROLE_CN_MAP['werewolf']}】。现在是第 {self.game_state['day']} 天的夜晚。\n\n"
             f"=== 你的狼人队友信息 ===\n{teammates_info}\n\n"
-            f"=== 游戏至今的记忆摘要 ===\n{memory_summary}\n\n"
+            f"=== 游戏至今的记忆摘要 ===\n{memory_summary}"
+            f"{discussion_summary}\n"
             f"=== 你的任务 ===\n"
             f"请从以下玩家中选择一个淘汰：\n{', '.join(potential_targets)}\n"
-            f"综合考虑之前的游戏进程和当前局势，选择对狼人阵营最有利的目标。\n"
+            f"综合考虑之前的游戏进程、当前局势{'和刚才的讨论内容' if discussion_history else ''}，选择对狼人阵营最有利的目标。\n"
             f"请先进行思考，然后严格以'我们决定淘汰: [玩家姓名]'的格式给出你的最终答案。"
         )
         if isinstance(coordinator_wolf, UserAgent):
@@ -553,8 +558,8 @@ class GameMasterAgent(ReActAgent):
             self.game_state["night_info"]["killed_by_werewolf"] = target_name
             log_entry = f"狼人团队决定淘汰: {target_name}"
             
-            # 【修复】将狼人击杀记录添加到 full_history
-            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
+            # 【修复】狼人击杀是私密信息，只记录到 game_logger，不记录到 full_history
+            # full_history 中只记录公开的裁判公告（在白天开始时记录）
             game_logger.add_entry(log_entry)
             
             await self._announce_to_public("狼人已完成击杀。", role="system", to_print=False)
@@ -571,6 +576,113 @@ class GameMasterAgent(ReActAgent):
             game_logger.add_entry(log_entry)
             
             await self._announce_to_public("狼人已完成击杀。", role="system", to_print=False)
+
+    async def _werewolf_discussion(self, werewolves: list, potential_targets: list) -> list:
+        """
+        狼人讨论阶段：2轮讨论，每个狼人依次发言
+        使用 MsgHub 让狼人看到完整的讨论历史
+        
+        Returns:
+            list: 讨论历史记录，格式为 ["Player_X: 发言内容", ...]
+        """
+        discussion_history = []  # 用于收集讨论内容
+        
+        if len(werewolves) == 1:
+            # 只有一个狼人，无需讨论
+            game_logger.add_entry("[狼人讨论]: 只有一个狼人存活，跳过讨论阶段")
+            return discussion_history
+        
+        # 宣布讨论开始
+        discussion_intro = (
+            f"狼人团队讨论开始。当前存活的狼人有：{', '.join([w.name for w in werewolves])}\n"
+            f"可选择的击杀目标：{', '.join(potential_targets)}\n"
+            f"现在进行2轮讨论，每人依次发言，讨论击杀策略。"
+        )
+        await self.werewolf_channel.broadcast(Msg(self.name, discussion_intro, role="system"))
+        game_logger.add_entry(f"[狼人讨论开始]: {len(werewolves)}名狼人，2轮讨论")
+        
+        # 进行2轮讨论
+        for round_num in range(1, 3):
+            round_intro = f"\n===== 第 {round_num} 轮讨论 ====="
+            await self.werewolf_channel.broadcast(Msg(self.name, round_intro, role="system"))
+            
+            for werewolf in werewolves:
+                # 获取狼人的记忆摘要
+                memory_summary = self._get_player_memory(werewolf.name)
+                
+                # 构建队友信息
+                teammates = [w.name for w in werewolves if w.name != werewolf.name]
+                teammates_info = f"你的队友：{', '.join(teammates)}" if teammates else "你是唯一的狼人"
+                
+                # 根据轮次构建不同的提示词
+                if round_num == 1:
+                    task_instruction = (
+                        f"请分析当前局势，提出你认为最佳的击杀目标，并说明理由。\n"
+                        f"考虑因素：\n"
+                        f"- 谁最可能是神职（预言家、女巫、猎人）\n"
+                        f"- 谁对狼人威胁最大\n"
+                        f"- 谁最有可能带领好人阵营\n"
+                        f"简洁发言，1-2句话即可。"
+                    )
+                else:  # round_num == 2
+                    task_instruction = (
+                        f"这是第二轮讨论。请综合队友的意见，表达你的看法。\n"
+                        f"可以同意队友的建议，也可以提出不同意见。\n"
+                        f"简洁发言，1-2句话即可。"
+                    )
+                
+                # 构建完整的 Prompt
+                prompt = (
+                    f"你是 {werewolf.name}，你的身份是【{ROLE_CN_MAP['werewolf']}】。现在是第 {self.game_state['day']} 天夜晚的狼人讨论环节（第{round_num}/2轮）。\n\n"
+                    f"=== 你的队友信息 ===\n{teammates_info}\n\n"
+                    f"=== 游戏至今的记忆摘要 ===\n{memory_summary}\n\n" if self.game_state['day'] > 1 else "现在是游戏的第一晚，暂时还没有玩家发言，你们可以随机选择一个目标\n"
+                    f"=== 可击杀目标 ===\n{', '.join(potential_targets)}\n\n"
+                    f"=== 你的任务 ===\n{task_instruction}"
+                )
+                
+                # 如果是人类玩家，简化提示
+                if getattr(werewolf, 'is_user', False):
+                    prompt = (
+                        f"[狼人讨论 - 第{round_num}/2轮]\n"
+                        f"队友：{', '.join(teammates)}\n"
+                        f"可击杀：{', '.join(potential_targets)}\n"
+                        f"请发言（1-2句话，提出或讨论击杀目标）："
+                    )
+                
+                # 记录 Prompt
+                prompt_logger.add_prompt(
+                    title=f"狼人讨论 - {werewolf.name} (第{round_num}轮)",
+                    prompt=prompt
+                )
+                
+                # 使用静默回复避免在控制台显示（狼人讨论是私密的）
+                response_msg = await self._get_silent_reply(werewolf, prompt)
+                
+                # 解析回复
+                raw_response = self._parse_ai_response(response_msg.content)
+                
+                # 记录到日志（这是唯一应该记录的地方）
+                model_info = self._get_agent_model_info(werewolf)
+                game_logger.add_entry(f"[狼人讨论-第{round_num}轮-{werewolf.name}-{model_info}]: {raw_response}")
+                
+                # 收集讨论历史（用于后续传递给决策者）
+                discussion_record = f"[第{round_num}轮] {werewolf.name}: {raw_response}"
+                discussion_history.append(discussion_record)
+                
+                # 【新增】如果当前有人类狼人玩家，在控制台显示所有狼人的发言
+                # 这样人类狼人可以看到队友的讨论
+                if any(getattr(w, 'is_user', False) for w in werewolves):
+                    print(f"{werewolf.name}: {raw_response}")
+                
+                # 广播到狼人频道（让其他狼人看到，但不在控制台显示）
+                await self.werewolf_channel.broadcast(Msg(werewolf.name, raw_response, role="assistant"))
+        
+        # 讨论结束提示
+        discussion_end = f"\n讨论结束。现在由 {werewolves[0].name} 作为代表，做出最终决策。"
+        await self.werewolf_channel.broadcast(Msg(self.name, discussion_end, role="system"))
+        game_logger.add_entry("[狼人讨论结束]: 进入最终决策阶段")
+        
+        return discussion_history  # 返回讨论历史
 
     async def _seer_action(self) -> None:
         """【新功能】实现预言家验人逻辑"""
@@ -638,8 +750,7 @@ class GameMasterAgent(ReActAgent):
             result = "好人" if target_identity != "werewolf" else "狼人"
             log_entry = f"预言家 {seer_agent.name} 查验了 {target_name}，结果是【{result}】。"
             
-            # 【修复】将查验记录同时添加到 full_history 和 game_logger
-            self.game_state["full_history"].append(f"[第{self.game_state['day']}天-夜晚]: {log_entry}")
+            # 【修复】预言家查验是私密信息，只记录到 game_logger，不记录到 full_history
             game_logger.add_entry(log_entry)
             
             # 将查验结果私密地告诉预言家，使用特殊前缀标记
@@ -884,8 +995,12 @@ class GameMasterAgent(ReActAgent):
             agent = player_data["agent"]
             
             # 【修复】在白天发言前为该玩家生成记忆摘要
-            # 白天发言前的摘要应该只包含昨晚的死亡和遗言等信息
-            memory_summary = await self._generate_memory_summary(agent.name, for_morning=True)
+            # 包含：以往记忆 + 昨晚事件 + 今天之前的玩家发言
+            memory_summary = await self._generate_memory_summary(
+                agent.name, 
+                for_morning=True, 
+                current_discussion=self.game_state["discussion_history"]  # 传递当天之前的发言
+            )
             game_logger.add_entry(f"[白天发言前-为 {agent.name} 生成的记忆摘要]: {memory_summary}")
 
             # 【Prompt优化】为AI构建更丰富的上下文
@@ -971,7 +1086,7 @@ class GameMasterAgent(ReActAgent):
                     if len(parts) > 1:
                         # 检查分割后的第一部分是否主要是思考内容
                         first_part = parts[0].strip().lower()
-                        thinking_indicators = ['thinking', 'strategy', '策略', '分析', '我需要', '考虑', '想法', 'player_' + agent.split('_')[1] + '(thinking)']
+                        thinking_indicators = ['thinking', 'strategy', '策略', '分析', '我需要', '考虑', '想法', 'player_' + agent.name.split('_')[1] + '(thinking)']
                         
                         # 如果第一部分包含大量思考关键词，或明显是思考过程，则移除
                         if (len(first_part) > 100 and any(indicator in first_part for indicator in thinking_indicators)) or \
@@ -1096,6 +1211,11 @@ class GameMasterAgent(ReActAgent):
             await self._handle_last_words([eliminated_player_data])
         
         self._check_win_condition()
+        
+        # 【新增】投票阶段结束后，为所有存活玩家更新记忆摘要
+        # 确保进入夜晚时能获取到完整的白天信息（发言、投票、遗言、猎人开枪等）
+        if not self.game_state["game_over"]:
+            await self._update_all_players_memory_for_night()
 
     async def _collect_vote(self, voter: AgentBase, potential_targets: List[str]) -> Tuple[str, Optional[str]]:
         """辅助函数：向单个玩家收集投票，增强了对用户和AI输入的兼容性"""
@@ -1609,47 +1729,66 @@ class GameMasterAgent(ReActAgent):
             except Exception as e:
                 game_logger.add_entry(f"[夜晚前更新记忆失败]: {player_name} - {e}")
 
-    async def _generate_memory_summary(self, player_name: str, for_morning: bool = False) -> str:
-        """【逻辑重构】实现增量式记忆摘要"""
+    async def _generate_memory_summary(self, player_name: str, for_morning: bool = False, current_discussion: list = None) -> str:
+        """
+        【逻辑重构】实现增量式记忆摘要
+        
+        Args:
+            player_name: 玩家名称
+            for_morning: 是否是白天发言前生成摘要
+            current_discussion: 当天已经发生的发言列表（只在白天发言时使用）
+        """
         player_data = self.game_state["players"][player_name]
         previous_summary = player_data.get("memory_summary", "这是游戏的初始阶段，还没有历史记忆。")
 
         # 【修复】根据调用场景确定需要包含的事件范围
         current_day = self.game_state['day']
         
-        # 如果是第一天，或者之前没有摘要，则从游戏开始整理
-        if current_day == 1 or previous_summary == "这是游戏的初始阶段，还没有历史记忆。":
-            # 第一天：收集所有历史事件
-            new_events = self.game_state["full_history"]
-            context_desc = "游戏开始至今的所有事件"
-        elif for_morning:
-            # 【新增】白天发言前：只包含昨晚的事件（夜晚死亡、遗言等）
-            yesterday = current_day - 1
-            new_events = [
+        if for_morning:
+            # ===== 白天发言前生成摘要 =====
+            # 包含：昨晚的公开结果 + 当天之前的玩家发言
+            
+            # 1. 昨晚的公开结果（死亡信息）
+            night_events = [
                 log for log in self.game_state["full_history"] 
-                if f"[第{yesterday}天-夜晚]" in log or f"[第{yesterday}天-遗言]" in log or f"[第{yesterday}天-猎人开枪]" in log
+                if f"[第{current_day}天-夜晚]" in log
             ]
-            context_desc = f"第{yesterday}天夜晚发生的事件"
+            
+            # 2. 当天之前的玩家发言
+            today_discussion = current_discussion if current_discussion else []
+            
+            # 合并事件
+            new_events = night_events + today_discussion
+            context_desc = f"昨晚（第{current_day}天夜晚）的结果 + 今天之前的发言"
+            
         else:
-            # 夜晚前：收集当天完整的白天信息（发言、投票、遗言等）
+            # ===== 夜晚前更新记忆 =====
+            # 收集当天完整的白天信息（发言、投票、遗言等）
             new_events = [
                 log for log in self.game_state["full_history"] 
                 if f"[第{current_day}天" in log
             ]
-            context_desc = f"第{current_day}天已发生的事件"
+            context_desc = f"第{current_day}天已发生的所有事件"
         
         if not new_events:
             # 如果没有新事件，直接返回上一份摘要
             return previous_summary
 
         # 【关键修复】确保包含所有关键事件类型
+        # 注意：discussion_history 中的发言格式是 "玩家 Player_X 说: ..."，不包含"发言"关键词
+        # 所以需要区分处理
         important_events = []
         for event in new_events:
-            # 过滤重要事件：发言、投票、淘汰、遗言、猎人开枪、夜晚死亡
-            if any(keyword in event for keyword in [
-                "发言", "投票", "被淘汰", "遗言", "猎人开枪", "被淘汰了", 
-                "预言家查验", "女巫", "触发开枪技能", "开枪带走"
-            ]):
+            # 如果是 full_history 中的事件，需要过滤
+            if event.startswith("[第"):
+                # 过滤重要事件：投票、淘汰、遗言、猎人开枪、夜晚死亡
+                if any(keyword in event for keyword in [
+                    "发言", "投票", "被淘汰", "遗言", "猎人开枪", "被淘汰了", 
+                    "触发开枪技能", "开枪带走", "平安夜"
+                ]):
+                    important_events.append(event)
+            else:
+                # 如果是 discussion_history 中的发言，直接保留
                 important_events.append(event)
         
         events_str = "\n".join(important_events) if important_events else "\n".join(new_events)
@@ -1665,7 +1804,7 @@ class GameMasterAgent(ReActAgent):
         )
         
         try:
-            # 【新功能】记录Prompt
+            # 【新功能】记录Prompt到常规日志
             prompt_logger.add_prompt(
                 title=f"为 {player_name} 生成记忆摘要的Prompt",
                 prompt=prompt
@@ -1673,6 +1812,11 @@ class GameMasterAgent(ReActAgent):
             # 【修改】使用专门的摘要模型而不是裁判的主模型
             # 创建一个临时的"摘要生成代理"，使用摘要模型
             new_summary = await self._call_summary_model(prompt)
+            
+            # 【新增】如果是夜晚前更新记忆，记录到专门的夜晚记忆日志（实时写入）
+            # not for_morning 表示是夜晚前更新，而不是白天发言前更新
+            if not for_morning:
+                memory_logger.add_memory_update(player_name, prompt, new_summary)
             
             # 更新该玩家的记忆状态
             self.game_state["players"][player_name]["memory_summary"] = new_summary
